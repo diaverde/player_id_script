@@ -74,7 +74,9 @@ class Program
                 if (response.TryGetProperty("choices", out var identifiedPlayer))
                 {
                     string playerInfo = identifiedPlayer[0].GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
-                    if (!string.IsNullOrEmpty(playerInfo) && Guid.TryParse(playerInfo, out Guid result))
+                    if (!string.IsNullOrEmpty(playerInfo)
+                        && playerInfo.Length >= 36
+                        && Guid.TryParse(playerInfo.Substring(0,36), out Guid result))
                     {
                         // Update the player record in the database
                         UpdatePlayerRecord(connectionString, player.ContentTitleCatId, playerInfo);
@@ -107,10 +109,10 @@ class Program
         conn.Open();
         using var cmd = new SqlCommand(
             //@"SELECT ID, CID, Name 
-            @"SELECT TOP(30) ID, CID, Name 
+            @"SELECT TOP(30) ID, CID, Name
             FROM [RSN_CDN].[dbo].[ContentTitleCat]
-            WHERE Category='Player' AND Value IS NULL"
-            //AND ID > 25621"
+            WHERE Category='Player' AND Value IS NULL
+            AND ID > 42826"
             , conn);
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -251,9 +253,9 @@ class Program
         const string baseText =
             @"Help me identify a player from the roster of two teams. I will send you a single text in the user content. 
             This text may contain: 
-            - a part of the player''s name, 
-            - a text and number combination with a reference to any of the teams and a jersey number, 
-            - several of the previous combinations,separated by spaces. 
+            - case 1: a part of the player''s name, 
+            - case 2: a text and number combination with a reference to any of the teams and a jersey number, 
+            - case 3: several of the previous combinations, separated by spaces. 
             I will send you here a json-like text with two rosters with detailed information of each team''s players and coaches.
             Simply identify the ""id"" attribute of the most likely person (or people, if several were identified from a space
             separated input) and return it as simple string or a comma-separated string if more than one person was found.
