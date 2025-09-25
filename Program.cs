@@ -49,6 +49,7 @@ class Program
         teams = GetTeamRoster(connectionString, teams);
 
         // 6. Identify players using OpenAI API
+        Dictionary<int, List<PlayerToIdentify>> playersInGameCache = new Dictionary<int, List<PlayerToIdentify>>();
         int identifiedCount = 0;
         foreach (var player in unidentifiedPlayers)
         {
@@ -59,6 +60,7 @@ class Program
                 continue;
             }
 
+            int gameId = contentTeams.FirstOrDefault(c => c.Cid == player.Cid)?.GameId ?? 0;
             var homeTeamGuid = contentTeams.FirstOrDefault(c => c.Cid == player.Cid)?.HomeTeamGuid;
             var awayTeamGuid = contentTeams.FirstOrDefault(c => c.Cid == player.Cid)?.AwayTeamGuid;
 
@@ -67,29 +69,55 @@ class Program
 
             try
             {
-                string prompt = buildGPTPrompt(homeTeamInfo, awayTeamInfo, player.Name);
-                //Console.WriteLine($"Identifying player: {player.Name} with prompt: {prompt}");
-                var response = await IdentifyPlayerFromApi(oaiApiUrl, oaiApiKey, prompt);
-                //Console.WriteLine(JsonSerializer.Deserialize<JsonElement>(response, new JsonSerializerOptions { WriteIndented = true }));
-                if (response.TryGetProperty("choices", out var identifiedPlayer))
+                string playerInfo = string.Empty;
+
+                // If we have already identified a player in this game, reuse that player's team info;
+                // otherwise call the API
+                bool calledOpenAI = false;
+                if (gameId > 0 && playersInGameCache.ContainsKey(gameId) && playersInGameCache[gameId].Any(p => p.Name == player.Name))
                 {
-                    string playerInfo = identifiedPlayer[0].GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
-                    if (!string.IsNullOrEmpty(playerInfo)
-                        && playerInfo.Length >= 36
-                        && Guid.TryParse(playerInfo.Substring(0,36), out Guid result))
+                    //Console.WriteLine($"Identifying player: {player.Name} from game {gameId} using cached data.");
+                    playerInfo = playersInGameCache[gameId].First(p => p.Name == player.Name).Value;
+                }
+                else
+                {
+                    string prompt = buildGPTPrompt(homeTeamInfo, awayTeamInfo, player.Name);
+                    //Console.WriteLine($"Identifying player: {player.Name} with prompt: {prompt}");
+                    var response = await IdentifyPlayerFromApi(oaiApiUrl, oaiApiKey, prompt);
+                    //Console.WriteLine(JsonSerializer.Deserialize<JsonElement>(response, new JsonSerializerOptions { WriteIndented = true }));
+                    if (response.TryGetProperty("choices", out var identifiedPlayer))
                     {
-                        // Update the player record in the database
-                        UpdatePlayerRecord(connectionString, player.ContentTitleCatId, playerInfo);
-                        Console.WriteLine($"Identified {playerInfo} as player {player.Name}");
-                        identifiedCount++;
+                        playerInfo = identifiedPlayer[0].GetProperty("message").GetProperty("content").GetString() ?? string.Empty;
                     }
-                    else
+                    calledOpenAI = true;
+                }
+                
+                if (!string.IsNullOrEmpty(playerInfo)
+                    && playerInfo.Length >= 36
+                    && Guid.TryParse(playerInfo.Substring(0, 36), out Guid result))
+                {
+                    // Update the player record in the database
+                    UpdatePlayerRecord(connectionString, player.ContentTitleCatId, playerInfo);
+                    Console.WriteLine($"Identified {playerInfo} as player {player.Name}");
+                    identifiedCount++;
+
+                    // Cache the identified player for potential future use
+                    player.Value = playerInfo;
+                    if (!playersInGameCache.ContainsKey(gameId))
                     {
-                        Console.WriteLine($"No player identified for {player.Name}");
+                        playersInGameCache[gameId] = new List<PlayerToIdentify> { player };
+                    }
+                    else if (!playersInGameCache[gameId].Any(p => p.Name == player.Name))
+                    {
+                        playersInGameCache[gameId].Add(player);
                     }
                 }
+                else
+                {
+                    Console.WriteLine($"No player identified for {player.Name}");
+                }
 
-                await Task.Delay(900); // Delay to avoid hitting API rate limits
+                if (calledOpenAI) await Task.Delay(900); // Delay to avoid hitting API rate limits
             }
             catch (Exception ex)
             {
@@ -99,7 +127,7 @@ class Program
 
         Console.WriteLine($"Identified {identifiedCount} players out of {unidentifiedPlayers.Count} total players.");
         Console.WriteLine("Player identification process completed.");
-        Console.WriteLine($"Skipped {string.Join(',', contentToSkip)}.");
+        //Console.WriteLine($"Skipped {string.Join(',', contentToSkip)}.");
     }
 
     static List<PlayerToIdentify> GetPlayersToIdentify(string connectionString)
@@ -109,10 +137,11 @@ class Program
         conn.Open();
         using var cmd = new SqlCommand(
             //@"SELECT ID, CID, Name 
-            @"SELECT TOP(30) ID, CID, Name
+            @"SELECT TOP(2000) ID, CID, Name
             FROM [RSN_CDN].[dbo].[ContentTitleCat]
-            WHERE Category='Player' AND Value IS NULL
-            AND ID > 42826"
+            WHERE Category='Player' AND Value IS NULL             
+            ORDER BY CID"
+            //AND CID>40321409
             , conn);
         using var reader = cmd.ExecuteReader();
         while (reader.Read())
@@ -149,18 +178,6 @@ class Program
             teams.Add(team);
         }
 
-        // Special case for the Athletics, as they don't appear in the Team_Full table
-        if (teams.All(t => t.Name != "Athletics"))
-        {
-            teams.Add(new TeamProfile
-            {
-                Id = 85, // ID in the RSN_CDN database
-                Guid = new Guid("27A59D3B-FF7C-48EA-B016-4798F560F5E1"), // GUID in SportRadar
-                Name = "Athletics",
-                Alias = "ATH",
-                League = "MLB"
-            });
-        }
         return teams;
     }
 
@@ -168,19 +185,15 @@ class Program
     {
         var content = new List<ContentMetadata>();
         StringBuilder stringBuilder = new StringBuilder();
-        foreach (long cId in cids)
-        {
-            stringBuilder.Append($"{cId},");
-        }
-        stringBuilder.Remove(stringBuilder.Length - 1, 1);
-        string cidRange = stringBuilder.ToString();
+        long minCid = cids.Min();
+        long maxCid = cids.Max();
 
         using var conn = new SqlConnection(connectionString);
         conn.Open();
         using var cmd = new SqlCommand(
-            @$"SELECT CID, HomeID, VisitorID  
+            @$"SELECT CID, GameID, HomeID, VisitorID  
             FROM [RSN_CDN].[dbo].[Content_Full]
-            WHERE CID IN ({cidRange})", conn);
+            WHERE CID BETWEEN {minCid} AND {maxCid}", conn);
         //Console.WriteLine($"Querying content for CIDs: {cidRange}");
         //Console.WriteLine($"SQL Command: {cmd.CommandText}");
         //cmd.Parameters.AddWithValue("@CIDs", cidRange);
@@ -190,12 +203,13 @@ class Program
             ContentMetadata contentMetadata = new ContentMetadata
             {
                 Cid = reader.GetInt64(0),
-                HomeTeamId = reader.IsDBNull(1) ? 0 : reader.GetInt32(1),
-                AwayTeamId = reader.IsDBNull(2) ? 0 : reader.GetInt32(2)
+                GameId = reader.IsDBNull(1) ? 0 : reader.GetInt32(1),
+                HomeTeamId = reader.IsDBNull(2) ? 0 : reader.GetInt32(2),
+                AwayTeamId = reader.IsDBNull(3) ? 0 : reader.GetInt32(3)
             };
 
-            // If HomeID or VisitorID is null, we skip this entry
-            if (contentMetadata.HomeTeamId == 0 || contentMetadata.AwayTeamId == 0)
+            // If GameID, HomeID or VisitorID is null, we skip this entry
+            if (contentMetadata.GameId == 0 || contentMetadata.HomeTeamId == 0 || contentMetadata.AwayTeamId == 0)
             {
                 continue;
             }
@@ -237,7 +251,7 @@ class Program
                     Id = reader.GetGuid(0),
                     FullName = reader.GetString(1),
                     ShortName = reader.GetString(2),
-                    JerseyNumber = reader.IsDBNull(3) ? null : reader.GetInt32(3).ToString()
+                    JerseyNumber = reader.IsDBNull(3) ? null : reader.GetString(3)
                 };
 
                 players.Add(member);

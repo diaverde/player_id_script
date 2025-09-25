@@ -9,6 +9,7 @@ record PlayerToIdentify
 record ContentMetadata
 {
     public long Cid { get; set; }
+    public int GameId { get; set; }
     public int HomeTeamId { get; set; }
     public int AwayTeamId { get; set; }
     public Guid HomeTeamGuid { get; set; }
